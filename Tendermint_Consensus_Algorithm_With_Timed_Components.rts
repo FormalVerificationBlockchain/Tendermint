@@ -1,0 +1,373 @@
+﻿//@@Tendermint_Consensus_Algorithm@@
+
+
+#import "PAT.Lib.Tendermint";
+
+
+#define N 4;
+#define F 1;
+#define INIT_TIMEOUT_PROPOSE 3;
+#define INIT_TIMEOUT_PREVOTE 3;
+#define INIT_TIMEOUT_PRECOMMIT 3;
+#define TIMEOUT_DELTA 1;
+#define BOUND_DELTA 5;
+#define MESSAGE_LOG_DEFAULT_VALUE -2;
+
+enum {UNDEFINED, PROPOSE, PREVOTE, PRECOMMIT};
+enum {NIL, DECISION_T, DECISION_F};
+enum {ACQUIRE, RELEASE};
+enum {PREVOTE_DECISION_MADE, PRECOMMIT_DECISION_MADE, COMMIT_DECISION_MADE};
+
+var rounds = [0(N)];
+var steps = [UNDEFINED(N)];
+var decisions = [NIL(N)];
+var locked_values = [NIL(N)];
+var locked_rounds = [-1(N)];
+var valid_values = [NIL(N)];
+var valid_rounds = [-1(N)];
+var proposals = [NIL(N)];
+var<MessageLogList> message_logs = new MessageLogList(4, 1);
+var honest_processes = [true, true, true, true];
+
+channel proposal_broadcast_network[N] 1;
+channel prevote_broadcast_network[N] N;
+channel precommit_broadcast_network[N] N;
+
+channel mutex[N] 0;
+channel timeout_propose_signal[N] 0;
+channel timeout_prevote_signal[N] 0;
+channel timeout_precommit_signal[N] 0;
+
+
+UrgentSkip() = Skip deadline[0];
+
+StartRound(p, round) = 
+	mutex[p]!ACQUIRE ->> 
+	update_round_for_process.p{
+		rounds[p] = round
+	} ->>
+	update_step_to_propose_for_process.p{
+		steps[p] = PROPOSE
+	} ->>
+	ifa (round % N == p) {
+		prepare_proposal_for_process.p ->> 
+		ifa (valid_values[p] != NIL) {
+			update_proposal_to_valid_value_for_process.p{
+				proposals[p] = valid_values[p]
+			} ->>
+			UrgentSkip()
+		} else {
+			update_proposal_to_new_value_for_process.p{
+				if (honest_processes[p] == true) {
+					proposals[p] = DECISION_T;
+				} else {
+					proposals[p] = DECISION_F;
+				}
+			} ->> 
+			UrgentSkip()
+		};
+		BroadcastProposalMessage(p);
+		mutex[p]!RELEASE ->> 
+		UrgentSkip()
+	} else {
+		schedule_timer_for_on_timeout_propose_for_process.p ->> 
+		mutex[p]!RELEASE ->> 
+		(
+			( 
+				timeout_propose_signal[p]?PREVOTE_DECISION_MADE ->>
+				cancel_timer_for_on_timeout_propose_for_process.p ->>  
+				UrgentSkip() 
+			) timeout[INIT_TIMEOUT_PROPOSE + rounds[p] * TIMEOUT_DELTA] OnTimeoutPropose(p, rounds[p])
+		)
+	};
+
+//#alphabet BroadcastProposalMessage {i:{0..N-1} @ broadcast_proposal_from_process_to_process.p.i};
+BroadcastProposalMessage(p) = 
+	(||| i: {0..N-1} @ (
+		broadcast_proposal_from_process_to_process.p.i ->> 
+		proposal_broadcast_network[i]!(new ProposalMessage(p, rounds[p], proposals[p], valid_rounds[p])) -> 
+		UrgentSkip()
+	)) deadline[BOUND_DELTA];
+
+//#alphabet BroadcastPrevoteMessage {i:{0..N-1} @ broadcast_prevote_from_process_to_process.p.i};
+BroadcastPrevoteMessage(p, value) = 
+	(||| i: {0..N-1} @ (
+		broadcast_prevote_from_process_to_process.p.i ->> 
+		prevote_broadcast_network[i]!(new PrevoteMessage(p, rounds[p], value)) -> 
+		UrgentSkip()
+	)) deadline[BOUND_DELTA];
+
+//#alphabet BroadcastPrecommitMessage {i:{0..N-1} @ broadcast_precommit_from_process_to_process.p.i};
+BroadcastPrecommitMessage(p, value) = 
+	(||| i: {0..N-1} @ (
+		broadcast_precommit_from_process_to_process.p.i ->> 
+		precommit_broadcast_network[i]!(new PrecommitMessage(p, rounds[p], value)) -> 
+		UrgentSkip()
+	)) deadline[BOUND_DELTA];
+
+//#alphabet UponProposalNewValue {upon_receiving_proposal_with_new_value_by_process.p};
+UponProposalNewValue(p) = 
+	[message_logs.ContainsProposal(p, rounds[p], -1) && steps[p] == PROPOSE]
+	mutex[p]!ACQUIRE ->> 
+	upon_receiving_proposal_with_new_value_by_process.p ->> 
+	ifa (rounds[p] % N == p) {
+		no_timeout_propose_set_for_process.p ->> UrgentSkip()
+	} else {
+		timeout_propose_signal[p]!PREVOTE_DECISION_MADE ->> UrgentSkip()
+	};
+	ifa ((
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, rounds[p]) == DECISION_F)
+		) && 
+		(locked_rounds[p] == -1 || locked_values[p] == message_logs.GetProposalValue(p, rounds[p]))) {
+		prepare_prevote_v_for_process.p ->> 
+		BroadcastPrevoteMessage(p, message_logs.GetProposalValue(p, rounds[p]))
+	} else {
+		prepare_prevote_nil_for_process.p ->> 
+		BroadcastPrevoteMessage(p, NIL)
+	};
+	update_step_to_prevote_for_process.p{
+		steps[p] = PREVOTE
+	} ->>
+	mutex[p]!RELEASE ->> 
+	UponProposalNewValue(p);
+
+//#alphabet UponProposalOldValue {upon_receiving_proposal_and_prevotes_with_old_value_by_process.p};
+UponProposalOldValue(p) = 
+	[message_logs.ContainsProposalAndSufficientPrevotesForPrevoting(p, rounds[p]) && steps[p] == PROPOSE]
+	mutex[p]!ACQUIRE ->> 
+	upon_receiving_proposal_and_prevotes_with_old_value_by_process.p ->> 
+	ifa (rounds[p] % N == p) {
+		no_timeout_propose_set_for_process.p ->> UrgentSkip()
+	} else {
+		timeout_propose_signal[p]!PREVOTE_DECISION_MADE ->> UrgentSkip()
+	};
+	ifa ((
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, rounds[p]) == DECISION_F)
+		) && 
+		(locked_rounds[p] <= message_logs.GetProposalValidRound(p, rounds[p]) || locked_values[p] == message_logs.GetProposalValue(p, rounds[p]))) {
+		prepare_prevote_v_for_process.p ->> 
+		BroadcastPrevoteMessage(p, message_logs.GetProposalValue(p, rounds[p]))
+	} else {
+		prepare_prevote_nil_for_process.p ->> 
+		BroadcastPrevoteMessage(p, NIL)
+	};
+	update_step_to_prevote_for_process.p{
+		steps[p] = PREVOTE
+	} ->> 
+	mutex[p]!RELEASE ->> 
+	UponProposalOldValue(p);
+
+//#alphabet UponSufficientPrevoteAny {upon_receiving_prevotes_with_any_payload_by_process.p};
+UponSufficientPrevoteAny(p, effective_round) = 
+	[message_logs.ContainsSufficientPrevotes(p, rounds[p], MESSAGE_LOG_DEFAULT_VALUE) && rounds[p] >= effective_round && steps[p] == PREVOTE]
+	upon_receiving_prevotes_with_any_payload_by_process.p ->> 
+	schedule_timer_for_on_timeout_prevote_for_process.p ->> 
+	(
+		(
+			timeout_prevote_signal[p]?PRECOMMIT_DECISION_MADE ->> 
+			cancel_timer_for_on_timeout_prevote_for_process.p ->> 
+			UrgentSkip() 
+		) timeout[INIT_TIMEOUT_PREVOTE + rounds[p] * TIMEOUT_DELTA] OnTimeoutPrevote(p, rounds[p])
+	);
+	UponSufficientPrevoteAny(p, rounds[p] + 1);
+
+//#alphabet UponSufficientPrevoteValue {upon_receiving_prevotes_with_value_by_process.p};
+UponSufficientPrevoteValue(p, effective_round) = 
+	[
+		message_logs.ContainsProposalAndSufficientPrevotesForPrecommitting(p, rounds[p]) &&
+		(
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, rounds[p]) == DECISION_F) 
+		) && 
+		rounds[p] >= effective_round && steps[p] >= PREVOTE
+	]
+	mutex[p]!ACQUIRE ->> 
+	upon_receiving_prevotes_with_value_by_process.p ->> 
+	ifa (steps[p] == PREVOTE) {
+		timeout_prevote_signal[p]!PRECOMMIT_DECISION_MADE ->> 
+		update_locked_value_for_process.p{
+			locked_values[p] = message_logs.GetProposalValue(p, rounds[p])
+		} ->> 
+		update_locked_round_for_process.p{
+			locked_rounds[p] = rounds[p]
+		} ->> 
+		BroadcastPrecommitMessage(p, message_logs.GetProposalValue(p, rounds[p]));
+		update_step_to_precommit_for_process.p{
+			steps[p] = PRECOMMIT
+		} ->> 
+		UrgentSkip()
+	};
+	update_valid_value_for_process.p{
+		valid_values[p] = message_logs.GetProposalValue(p, rounds[p])
+	} ->>
+	update_valid_round_for_process.p{
+		valid_rounds[p] = rounds[p]
+	} ->>
+	mutex[p]!RELEASE ->> 
+	UponSufficientPrevoteValue(p, rounds[p] + 1);
+
+//#alphabet UponSufficientPrevoteNil {upon_receiving_prevotes_with_nil_by_process.p}; 
+UponSufficientPrevoteNil(p) = 
+	[message_logs.ContainsSufficientPrevotes(p, rounds[p], NIL) && steps[p] == PREVOTE]
+	mutex[p]!ACQUIRE ->> 
+	upon_receiving_prevotes_with_nil_by_process.p ->> 
+	timeout_prevote_signal[p]!PRECOMMIT_DECISION_MADE ->> 
+	BroadcastPrecommitMessage(p, NIL);
+	update_step_to_precommit_for_process.p{
+		steps[p] = PRECOMMIT
+	} ->>
+	mutex[p]!RELEASE ->> 
+	UponSufficientPrevoteNil(p);
+
+//#alphabet UponSufficientPrecommitAny {upon_receiving_precommits_with_any_payload_by_process.p};
+UponSufficientPrecommitAny(p, effective_round) = 
+	[message_logs.ContainsSufficientPrecommits(p, rounds[p], MESSAGE_LOG_DEFAULT_VALUE) && rounds[p] >= effective_round]
+	upon_receiving_precommits_with_any_payload_by_process.p ->> 
+	schedule_timer_for_on_timeout_precommit_for_process.p ->> 
+	(
+		(
+			timeout_precommit_signal[p]?COMMIT_DECISION_MADE ->> 
+			cancel_timer_for_on_timeout_precommit_for_process.p ->> 
+			UrgentSkip()
+		) timeout[INIT_TIMEOUT_PRECOMMIT + rounds[p] * TIMEOUT_DELTA] OnTimeoutPrecommit(p, rounds[p])
+	);
+	UponSufficientPrecommitAny(p, rounds[p] + 1);
+
+UponSufficientPrecommitValue(p) = 
+	[message_logs.ContainsProposalAndSufficientPrecommits(p) && decisions[p] == NIL]
+	mutex[p]!ACQUIRE ->> 
+	upon_receiving_proposal_and_precommits_with_value_by_process.p ->> 
+	ifa (
+			(honest_processes[p] == true && message_logs.GetCommitReadyValue(p) == DECISION_T) ||
+			(honest_processes[p] == false && message_logs.GetCommitReadyValue(p) == DECISION_F)
+		) {
+		timeout_precommit_signal[p]!COMMIT_DECISION_MADE ->> 
+		update_decision_to_commit_ready_value_for_process.p{
+			decisions[p] = message_logs.GetCommitReadyValue(p)
+		} ->> 
+		mutex[p]!RELEASE ->> 
+		UrgentSkip()
+	} else {
+		mutex[p]!RELEASE ->> 
+		UrgentSkip()
+	};
+
+UponSufficientMessageAny(p) = 
+	[message_logs.GetLatestRoundWithSufficientMessages(p) > rounds[p]]
+	StartRound(p, message_logs.GetLatestRoundWithSufficientMessages(p));
+	UponSufficientMessageAny(p);
+
+//#alphabet OnTimeoutPropose {timeout_propose_by_process.p};
+OnTimeoutPropose(p, round) = 
+	mutex[p]!ACQUIRE ->> 
+	ifa (round == rounds[p] && steps[p] == PROPOSE) {
+		timeout_propose_by_process.p ->> 
+		BroadcastPrevoteMessage(p, NIL);
+		update_step_to_prevote_for_process.p{
+			steps[p] = PREVOTE
+		} ->>
+		mutex[p]!RELEASE ->> UrgentSkip()
+	} else {
+		mutex[p]!RELEASE ->> UrgentSkip()
+	};
+
+//#alphabet OnTimeoutPrevote {timeout_prevote_by_process.p};
+OnTimeoutPrevote(p, round) = 
+	mutex[p]!ACQUIRE ->> 
+	ifa (round == rounds[p] && steps[p] == PREVOTE) {
+		timeout_prevote_by_process.p ->> 
+		BroadcastPrecommitMessage(p, NIL);
+		update_step_to_precommit_for_process.p{
+			steps[p] = PRECOMMIT
+		} ->>
+		mutex[p]!RELEASE ->> UrgentSkip()
+	} else {
+		mutex[p]!RELEASE ->> UrgentSkip()
+	};
+
+//#alphabet OnTimeoutPrecommit {timeout_precommit_by_process.p}; 
+OnTimeoutPrecommit(p, round) = 
+	timeout_precommit_by_process.p ->> 
+	ifa (round == rounds[p]) {
+		StartRound(p, round + 1)
+	} else {
+		tau ->> UrgentSkip()
+	};
+
+DaemonThread(p) = 
+	proposal_broadcast_network[p]?proposal_message ->> 
+	mutex[p]!ACQUIRE ->> 
+	add_proposal_message_to_message_log_for_process.p{
+		message_logs.AddProposal(p, proposal_message);
+	} ->> 
+	mutex[p]!RELEASE ->> 
+	DaemonThread(p)
+	[]
+	prevote_broadcast_network[p]?prevote_message ->> 
+	mutex[p]!ACQUIRE ->> 
+	add_prevote_message_to_message_log_for_process.p{
+		message_logs.AddPrevote(p, prevote_message);
+	} ->> 
+	mutex[p]!RELEASE ->> 
+	DaemonThread(p)
+	[] 
+	precommit_broadcast_network[p]?precommit_message ->> 
+	mutex[p]!ACQUIRE ->> 
+	add_precommit_message_to_message_log_for_process.p{
+		message_logs.AddPrecommit(p, precommit_message);
+	} ->> 
+	mutex[p]!RELEASE ->> 
+	DaemonThread(p);
+
+Mutex(p) = 
+	mutex[p]?ACQUIRE ->> 
+	mutex[p]?RELEASE ->> 
+	Mutex(p);
+
+Tendermint() = 
+	||| p: {0..N-1} @ (
+		StartRound(p, 0) ||| 
+		UponProposalNewValue(p) ||| 
+		UponProposalOldValue(p) ||| 
+		UponSufficientPrevoteAny(p, 0) |||
+		UponSufficientPrevoteValue(p, 0) ||| 
+		UponSufficientPrevoteNil(p) ||| 
+		UponSufficientPrecommitAny(p, 0) |||
+		UponSufficientPrecommitValue(p) ||| 
+		UponSufficientMessageAny(p) ||| 
+		DaemonThread(p) ||| 
+		Mutex(p)
+	);
+
+#assert Tendermint() deadlockfree;
+
+#define four_processes_are_honest (
+	honest_processes[0] == true && 
+	honest_processes[1] == true && 
+	honest_processes[2] == true && 
+	honest_processes[3] == true
+);
+#define three_processes_are_honest (
+	honest_processes[1] == true && 
+	honest_processes[2] == true && 
+	honest_processes[3] == true
+);
+
+#define four_processes_make_true_decisions (
+	decisions[0] == DECISION_T && 
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T && 
+	decisions[3] == DECISION_T
+);
+#define three_processes_make_true_decisions (
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T && 
+	decisions[3] == DECISION_T
+);
+#assert Tendermint() |= [] (four_processes_are_honest -> <> four_processes_make_true_decisions);
+#assert Tendermint() |= [] (three_processes_are_honest -> <> three_processes_make_true_decisions);
+#assert Tendermint() reaches four_processes_make_true_decisions;
+#assert Tendermint() reaches three_processes_make_true_decisions;
+

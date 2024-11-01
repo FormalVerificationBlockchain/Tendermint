@@ -1,0 +1,497 @@
+﻿//@@Tendermint_Consensus_Algorithm@@
+
+
+#import "PAT.Lib.Tendermint_v4";
+
+
+#define N 4;
+#define F 1;
+#define INIT_TIMEOUT_PROPOSE 3;
+#define INIT_TIMEOUT_PREVOTE 3;
+#define INIT_TIMEOUT_PRECOMMIT 3;
+#define TIMEOUT_DELTA 1;
+#define BOUND_DELTA 4;
+#define MESSAGE_LOG_DEFAULT_VALUE -2;
+
+enum {UNDEFINED, PROPOSE, PREVOTE, PRECOMMIT};
+enum {NIL, DECISION_T, DECISION_F};
+//enum {ACQUIRE, RELEASE};
+//enum {PREVOTE_DECISION_MADE, PRECOMMIT_DECISION_MADE, COMMIT_DECISION_MADE};
+
+// 3-bit flag where 
+// the first one is for UponSufficientPrevoteAny, and 
+// the second one is for UponSufficientPrevoteValue, and 
+// the third one is for UponSufficientPrecommitAny
+var effective_rounds = [0(N)]; 
+var rounds:{0..2} = [0(N)];
+var steps: {0..3} = [UNDEFINED(N)];
+var decisions: {0..2} = [NIL(N)];
+var locked_values: {0..2} = [NIL(N)];
+var locked_rounds: {-1..2} = [-1(N)];
+var valid_values: {0..2} = [NIL(N)];
+var valid_rounds: {-1..2} = [-1(N)];
+var proposals: {0..2} = [NIL(N)];
+var<MessageLog> message_log = new MessageLog();
+hvar<AllMessages> all_messages = new AllMessages();
+hvar honest_processes = [true, true, true, true];
+
+//channel mutex 0;
+//channel timeout_propose_signal[N] 0;
+//channel timeout_prevote_signal[N] 0;
+//channel timeout_precommit_signal[N] 0;
+//channel upon_sufficient_prevote_any_sync[N] 0;
+//channel upon_sufficient_precommit_any_sync[N] 0;
+
+
+BroadcastProposalMessage(p, round, proposal, valid_round) = 
+	broadcast_proposal_message_to_all_processes_from_process.p{
+		message_log.AddProposal(new ProposalMessage(p, round, proposal, valid_round));
+	} -> 
+	Skip;
+
+BroadcastPrevoteMessage(p, round, prevote) = 
+	broadcast_prevote_message_to_all_processes_from_process.p{
+		message_log.AddPrevote(new PrevoteMessage(p, round, prevote));
+	} -> 
+	Skip;
+
+BroadcastPrecommitMessage(p, round, precommit) = 
+	broadcast_precommit_message_to_all_processes_from_process.p{
+		message_log.AddPrecommit(new PrecommitMessage(p, round, precommit));
+	} -> 
+	Skip;
+
+StartRound(p, round) = 
+	ifa (round >= rounds[p]) {
+		reset_all_flags_in_effective_rounds_for_process.p{
+			effective_rounds[p] = 0;
+		} -> 
+		update_round_and_step_for_process_in_round.p.round{
+			rounds[p] = round;
+			steps[p] = PROPOSE;
+		} -> 
+		ifa (round % N == p) {
+			ifa (valid_values[p] != NIL) {
+				update_proposal_to_valid_value_for_process_in_round.p.round{
+					proposals[p] = valid_values[p];
+				} -> 
+				Skip
+			} else {
+				update_proposal_to_new_value_for_process_in_round.p.round{
+					if (honest_processes[p] == true) {
+						proposals[p] = DECISION_T;
+					} else {
+						proposals[p] = DECISION_F;
+					}
+				} -> 
+				Skip
+			};
+			BroadcastProposalMessage(p, rounds[p], proposals[p], valid_rounds[p])
+		} else {
+			ScheduleOnTimeoutPropose(p, rounds[p])
+		}
+	};
+
+ScheduleOnTimeoutPropose(p, round) = 
+	[BOUND_DELTA > INIT_TIMEOUT_PROPOSE + round * TIMEOUT_DELTA || honest_processes[round % N] != honest_processes[p]]
+	OnTimeoutPropose(p, round)
+	[]
+	[honest_processes[round % N] == honest_processes[p]]
+	Skip;
+
+UponProposalValue(p) = 
+	[
+		(
+			p == 0 || 
+			(
+				rounds[p - 1] == rounds[p] &&
+				steps[p - 1] >= PREVOTE
+			) || 
+			rounds[p - 1] > rounds[p]
+		) && 
+		decisions[p] == NIL && 
+		steps[p] == PROPOSE && 
+		(
+			message_log.ContainsProposal(all_messages, rounds[p], -1)  || 
+			message_log.ContainsProposalAndSufficientPrevotesForPrevoting(all_messages, rounds[p])
+		)
+	]
+	ifa (
+		(
+			(honest_processes[p] == true && message_log.GetProposalValue(all_messages, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_log.GetProposalValue(all_messages, rounds[p]) == DECISION_F)
+		) && 
+		(
+			(
+				message_log.ContainsProposal(all_messages, rounds[p], -1) && 
+				(locked_rounds[p] == -1 || locked_values[p] == message_log.GetProposalValue(all_messages, rounds[p]))
+			) || 
+			(
+				message_log.ContainsProposalAndSufficientPrevotesForPrevoting(all_messages, rounds[p]) && 
+				(locked_rounds[p] <= message_log.GetProposalValidRound(all_messages, rounds[p]) || locked_values[p] == message_log.GetProposalValue(all_messages, rounds[p]))
+			)
+		)
+	) {
+		BroadcastPrevoteMessage(p, rounds[p], message_log.GetProposalValue(all_messages, rounds[p]))
+	} else {
+		BroadcastPrevoteMessage(p, rounds[p], NIL)
+	};
+	update_step_for_process_in_round.p.rounds[p]{
+		steps[p] = PREVOTE;
+	} -> 
+	Tendermint();
+
+//UponProposalNewValue(p) = 
+//	[decisions[p] == NIL && message_log.ContainsProposal(rounds[p], -1) && steps[p] == PROPOSE]
+//	UponProposalNewValueAuxiliary(p, rounds[p], locked_values[p], locked_rounds[p]);
+//
+//UponProposalNewValueAuxiliary(p, round, locked_value, locked_round) = 
+//	ifa ((
+//			(honest_processes[p] == true && message_log.GetProposalValue(round) == DECISION_T) || 
+//			(honest_processes[p] == false && message_log.GetProposalValue(round) == DECISION_F)
+//		) && 
+//		(locked_round == -1 || locked_value == message_log.GetProposalValue(round))) {
+//		BroadcastPrevoteMessage(p, round, message_log.GetProposalValue(round))
+//	} else {
+//		BroadcastPrevoteMessage(p, round, NIL)
+//	};
+//	update_step_for_process_in_round.p.round{
+//		steps[p] = PREVOTE;
+//	} -> 
+//	Tendermint();
+//
+//UponProposalOldValue(p) = 
+//	[decisions[p] == NIL && message_log.ContainsProposalAndSufficientPrevotesForPrevoting(rounds[p]) && steps[p] == PROPOSE]
+//	UponProposalOldValueAuxiliary(p, rounds[p], locked_values[p], locked_rounds[p]);
+//
+//UponProposalOldValueAuxiliary(p, round, locked_value, locked_round) = 
+//	ifa ((
+//			(honest_processes[p] == true && message_log.GetProposalValue(round) == DECISION_T) || 
+//			(honest_processes[p] == false && message_log.GetProposalValue(round) == DECISION_F)
+//		) && 
+//		(locked_round <= message_log.GetProposalValidRound(round) || locked_value == message_log.GetProposalValue(round))) {
+//		BroadcastPrevoteMessage(p, round, message_log.GetProposalValue(round))
+//	} else {
+//		BroadcastPrevoteMessage(p, round, NIL)
+//	};
+//	update_step_to_prevote_for_process_in_round.p.round{
+//		steps[p] = PREVOTE;
+//	} -> 
+//	Tendermint();
+
+UponSufficientPrevoteAny(p) = 
+	[
+		(
+			p == 0 || 
+			(
+				rounds[p - 1] == rounds[p] &&
+				steps[p - 1] >= PRECOMMIT
+			) || 
+			rounds[p - 1] > rounds[p]
+		) && 
+		decisions[p] == NIL && 
+		(effective_rounds[p] / 4) % 2 == 0 && 
+		steps[p] == PREVOTE && 
+		message_log.ContainsSufficientPrevotes(all_messages, rounds[p], MESSAGE_LOG_DEFAULT_VALUE)
+	]
+	enable_first_flag_in_effective_round_for_process.p{
+		effective_rounds[p] = effective_rounds[p] + 4;
+	} -> 
+	ScheduleOnTimeoutPrevote(p, rounds[p]);
+	Tendermint();
+
+ScheduleOnTimeoutPrevote(p, round) = 
+	[BOUND_DELTA > INIT_TIMEOUT_PREVOTE + round * TIMEOUT_DELTA || honest_processes[round % N] != honest_processes[p]]
+	OnTimeoutPrevote(p, round)
+	[]
+	[honest_processes[round % N] == honest_processes[p]]
+	Skip;
+	
+UponSufficientPrevoteValue(p) = 
+	[
+		(
+			p == 0 || 
+			(
+				rounds[p - 1] == rounds[p] && 
+				steps[p - 1] >= PRECOMMIT
+			) || 
+			rounds[p - 1] > rounds[p]
+		) && 
+		decisions[p] == NIL && 
+		(effective_rounds[p] / 2) % 2 == 0 && 
+		steps[p] >= PREVOTE && 
+		message_log.ContainsProposalAndSufficientPrevotesForPrecommitting(all_messages, rounds[p]) &&
+		(
+			(honest_processes[p] == true && message_log.GetProposalValue(all_messages, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_log.GetProposalValue(all_messages, rounds[p]) == DECISION_F) 
+		)
+	]
+	enable_second_flag_in_effective_round_for_process.p{
+		effective_rounds[p] = effective_rounds[p] + 2;
+	} -> 
+	ifa (steps[p] == PREVOTE) {
+		update_locked_value_and_locked_round_for_process_in_round.p.rounds[p]{
+			locked_values[p] = message_log.GetProposalValue(all_messages, rounds[p]);
+			locked_rounds[p] = rounds[p];
+		} -> 
+		BroadcastPrecommitMessage(p, rounds[p], message_log.GetProposalValue(all_messages, rounds[p]));
+		update_step_for_process_in_round.p.rounds[p]{
+			steps[p] = PRECOMMIT;
+		} -> 
+		Skip
+	};
+	update_valid_value_and_valid_round_for_process_in_round.p.rounds[p]{
+		valid_values[p] = message_log.GetProposalValue(all_messages, rounds[p]);
+		valid_rounds[p] = rounds[p];
+	} -> 
+	Tendermint();
+
+UponSufficientPrevoteNil(p) = 
+	[
+		(
+			p == 0 || 
+			(
+				rounds[p - 1] == rounds[p] && 
+				steps[p - 1] >= PRECOMMIT
+			) || 
+			rounds[p - 1] > rounds[p]
+		) && 
+		decisions[p] == NIL && 
+		steps[p] == PREVOTE && 
+		message_log.ContainsSufficientPrevotes(all_messages, rounds[p], NIL)
+	]
+	BroadcastPrecommitMessage(p, rounds[p], NIL);
+	update_step_for_process_in_round.p.rounds[p]{
+		steps[p] = PRECOMMIT;
+	} -> 
+	Tendermint();
+
+UponSufficientPrecommitAny(p) = 
+	[
+		(
+			p == 0 || 
+			rounds[p - 1] > rounds[p]
+		) && 
+		decisions[p] == NIL && 
+		effective_rounds[p] % 2 == 0 && 
+		message_log.ContainsSufficientPrecommits(all_messages, rounds[p], MESSAGE_LOG_DEFAULT_VALUE)
+	]
+	enable_third_flag_in_effective_round_for_process.p{
+		effective_rounds[p] = effective_rounds[p] + 1;
+	} -> 
+	ScheduleOnTimeoutPrecommit(p, rounds[p]);
+
+ScheduleOnTimeoutPrecommit(p, round) = 
+	[(BOUND_DELTA > INIT_TIMEOUT_PRECOMMIT + round * TIMEOUT_DELTA || message_log.ContainsProposalAndSufficientAdversePrecommits(all_messages, round) || honest_processes[round % N] == false) && round < 2]
+	OnTimeoutPrecommit(p, round)
+	[]
+	[(!message_log.ContainsProposalAndSufficientAdversePrecommits(all_messages, round) && honest_processes[round % N] == true) || round == 2]
+	Tendermint();
+
+UponSufficientPrecommitValue(p) = 
+	[
+		(
+			p == 0 || 
+			honest_processes[p - 1] == false || 
+			rounds[p - 1] > rounds[p] || 
+			decisions[p - 1] != NIL
+		) && 
+		decisions[p] == NIL && 
+		message_log.ContainsProposalAndSufficientPrecommits(all_messages) && 
+		(
+			(honest_processes[p] == true && message_log.GetCommitReadyValue(all_messages) == DECISION_T) ||
+			(honest_processes[p] == false && message_log.GetCommitReadyValue(all_messages) == DECISION_F)
+		)
+	]
+	update_decision_to_commit_ready_value_for_process_in_round.p.rounds[p]{
+		decisions[p] = message_log.GetCommitReadyValue(all_messages);
+//		message_log.Clear();
+	} -> 
+	Tendermint();
+
+UponSufficientMessageAny(p) = 
+	[
+		decisions[p] == NIL && 
+		message_log.GetLatestRoundWithSufficientMessages() > rounds[p]
+	]
+	StartRound(p, message_log.GetLatestRoundWithSufficientMessages());
+	Tendermint();
+
+OnTimeoutPropose(p, round) = 
+	ifa (round == rounds[p] && steps[p] == PROPOSE) {
+		BroadcastPrevoteMessage(p, round, NIL);
+		update_step_for_process_in_round.p.round{
+			steps[p] = PREVOTE;
+		} -> 
+		Skip
+	};
+
+OnTimeoutPrevote(p, round) = 
+	ifa (round == rounds[p] && steps[p] == PREVOTE) {
+		BroadcastPrecommitMessage(p, round, NIL);
+		update_step_for_process_in_round.p.round{
+			steps[p] = PRECOMMIT;
+		} -> 
+		Skip
+	};
+
+OnTimeoutPrecommit(p, round) = 
+	ifa (decisions[p] == NIL && round == rounds[p]) { // decisions[p] == NIL is not in the originally proposed algorithm
+		StartRound(p, round + 1)
+	};
+	Tendermint();
+
+OnTimeoutPrevoteManual() = 
+	[
+		(
+			(effective_rounds[0] / 4) % 2 == 1 && 
+			steps[0] == PREVOTE && 
+			message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[0])
+		) ||
+		(
+			(effective_rounds[1] / 4) % 2 == 1 && 
+			steps[1] == PREVOTE && 
+			message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[1])
+		) ||
+		(
+			(effective_rounds[2] / 4) % 2 == 1 && 
+			steps[2] == PREVOTE && 
+			message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[2])
+		) ||
+		(
+			(effective_rounds[3] / 4) % 2 == 1 && 
+			steps[3] == PREVOTE && 
+			message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[3])
+		)
+	]
+	ifa (
+		steps[0] == PREVOTE && 
+		message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[0])
+	) {
+		OnTimeoutPrevote(0, rounds[0])
+	};
+	ifa (
+		steps[1] == PREVOTE && 
+		message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[1])
+	) {
+		OnTimeoutPrevote(1, rounds[1])
+	};
+	ifa (
+		steps[2] == PREVOTE && 
+		message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[2])
+	) {
+		OnTimeoutPrevote(2, rounds[2])
+	};
+	ifa (
+		steps[3] == PREVOTE && 
+		message_log.ContainsAllPrevotesWithoutMajorityValue(all_messages, rounds[3])
+	) {
+		OnTimeoutPrevote(3, rounds[3])
+	};
+	Tendermint();
+
+OnTimeoutPrecommitManual() = 
+	[
+		(
+			effective_rounds[0] % 2 == 1 && 
+			steps[0] == PRECOMMIT && 
+			message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[0])// the reason why this cannot be moved out of brackets to make it common to all disjuncts is because some other processes may have already proceeded to the next round up till PREVOTE stage
+		) ||
+		(
+			effective_rounds[1] % 2 == 1 && 
+			steps[1] == PRECOMMIT && 
+			message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[1])
+		) ||
+		(
+			effective_rounds[2] % 2 == 1 && 
+			steps[2] == PRECOMMIT && 
+			message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[2])
+		) ||
+		(
+			effective_rounds[3] % 2 == 1 && 
+			steps[3] == PRECOMMIT && 
+			message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[3])
+		)
+	]
+	ifa (
+		steps[0] == PRECOMMIT && 
+		message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[0]) 
+	) {
+		OnTimeoutPrecommit(0, rounds[0])
+	};
+	ifa (
+		steps[1] == PRECOMMIT && 
+		message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[1])
+	) {
+		OnTimeoutPrecommit(1, rounds[1])
+	};
+	ifa (
+		steps[2] == PRECOMMIT && 
+		message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[2])
+	) {
+		OnTimeoutPrecommit(2, rounds[2])
+	};
+	ifa (
+		steps[3] == PRECOMMIT && 
+		message_log.ContainsAllPrecommitsWithoutMajorityValue(all_messages, rounds[3])
+	) {
+		OnTimeoutPrecommit(3, rounds[3])
+	};
+	Tendermint();
+
+Validator(p) = 
+	UponProposalValue(p) [] 
+	UponSufficientPrevoteAny(p) [] 
+	UponSufficientPrevoteValue(p) [] 
+	UponSufficientPrevoteNil(p) [] 
+	UponSufficientPrecommitAny(p) [] 
+	UponSufficientPrecommitValue(p) [] 
+	UponSufficientMessageAny(p);
+
+TendermintBootstrap() = 
+	StartRound(0, 0);
+	StartRound(1, 0);
+	StartRound(2, 0);
+	StartRound(3, 0);
+	Tendermint();
+	
+Tendermint() = 
+	Validator(0) [] 
+	Validator(1) [] 
+	Validator(2) [] 
+	Validator(3) []
+	OnTimeoutPrevoteManual() [] 
+	OnTimeoutPrecommitManual();
+
+#assert TendermintBootstrap() deadlockfree;
+
+#define four_processes_are_honest (
+	honest_processes[0] == true && 
+	honest_processes[1] == true && 
+	honest_processes[2] == true && 
+	honest_processes[3] == true
+);
+#define three_processes_are_honest (
+	honest_processes[0] == true && 
+	honest_processes[1] == true && 
+	honest_processes[2] == true 
+);
+
+#define four_processes_make_true_decisions (
+	decisions[0] == DECISION_T && 
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T && 
+	decisions[3] == DECISION_T
+);
+#define three_processes_make_true_decisions (
+	decisions[0] == DECISION_T && 
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T
+);
+
+#assert TendermintBootstrap() |= [] <> four_processes_make_true_decisions;
+#assert TendermintBootstrap() |= [] <> three_processes_make_true_decisions;
+#assert TendermintBootstrap() reaches four_processes_make_true_decisions;
+#assert TendermintBootstrap() reaches three_processes_make_true_decisions;
+#assert TendermintBootstrap() nonterminating;
+

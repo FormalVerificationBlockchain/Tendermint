@@ -1,0 +1,389 @@
+﻿//@@Tendermint_Consensus_Algorithm@@
+
+
+#import "PAT.Lib.Tendermint";
+
+
+#define N 4;
+#define F 1;
+#define INIT_TIMEOUT_PROPOSE 3;
+#define INIT_TIMEOUT_PREVOTE 3;
+#define INIT_TIMEOUT_PRECOMMIT 3;
+#define TIMEOUT_DELTA 1;
+#define BOUND_DELTA 5;
+#define MESSAGE_LOG_DEFAULT_VALUE -2;
+
+enum {UNDEFINED, PROPOSE, PREVOTE, PRECOMMIT};
+enum {NIL, DECISION_T, DECISION_F};
+enum {ACQUIRE, RELEASE};
+enum {PREVOTE_DECISION_MADE, PRECOMMIT_DECISION_MADE, COMMIT_DECISION_MADE};
+
+var rounds = [0(N)];
+var steps = [UNDEFINED(N)];
+var decisions = [NIL(N)];
+var locked_values = [NIL(N)];
+var locked_rounds = [-1(N)];
+var valid_values = [NIL(N)];
+var valid_rounds = [-1(N)];
+var proposals = [NIL(N)];
+var<MessageLogList> message_logs = new MessageLogList(4, 1);
+var honest_processes = [true, true, true, true];
+
+channel proposal_broadcast_network[N] 1;
+channel prevote_broadcast_network[N] N;
+channel precommit_broadcast_network[N] N;
+
+channel mutex[N] 0;
+channel timeout_propose_signal[N] 0;
+channel timeout_prevote_signal[N] 0;
+channel timeout_precommit_signal[N] 0;
+
+
+BroadcastProposalMessage(p, round, proposal, valid_round) = 
+	||| i: {0..N-1} @ (
+		broadcast_proposal_from_process_to_process_in_round.p.i.round -> 
+		proposal_broadcast_network[i]!(new ProposalMessage(p, round, proposal, valid_round)) -> 
+		Skip
+	);
+
+BroadcastPrevoteMessage(p, round, prevote) = 
+	||| i: {0..N-1} @ (
+		broadcast_prevote_from_process_to_process_in_round.p.i.round -> 
+		prevote_broadcast_network[i]!(new PrevoteMessage(p, round, prevote)) -> 
+		Skip
+	);
+
+BroadcastPrecommitMessage(p, round, precommit) = 
+	||| i: {0..N-1} @ (
+		broadcast_precommit_from_process_to_process_in_round.p.i.round -> 
+		precommit_broadcast_network[i]!(new PrecommitMessage(p, round, precommit)) -> 
+		Skip
+	);
+
+StartRound(p, round) = 
+	ifa (round >= rounds[p]) {
+		mutex[p]!ACQUIRE -> 
+		update_round_for_process_in_round.p.round{
+			rounds[p] = round;
+		} -> 
+		update_step_to_propose_for_process_in_round.p.round{
+			steps[p] = PROPOSE;
+		} ->
+		ifa (round % N == p) {
+			prepare_proposal_for_process_in_round.p.round -> 
+			ifa (valid_values[p] != NIL) {
+				update_proposal_to_valid_value_for_process_in_round.p.round{
+					proposals[p] = valid_values[p];
+				} -> 
+				Skip
+			} else {
+				update_proposal_to_new_value_for_process_in_round.p.round{
+					if (honest_processes[p] == true) {
+						proposals[p] = DECISION_T;
+					} else {
+						proposals[p] = DECISION_F;
+					}
+				} -> 
+				Skip
+			};
+			BroadcastProposalMessage(p, rounds[p], proposals[p], valid_rounds[p]);
+			mutex[p]!RELEASE -> 
+			Skip
+		} else {
+			ScheduleOnTimeoutPropose(p, rounds[p])
+		}
+	};
+
+ScheduleOnTimeoutPropose(p, round) = 
+	schedule_timer_for_on_timeout_propose_for_process_in_round.p.round -> 
+	mutex[p]!RELEASE -> 
+	(
+		timeout_propose_signal[p]?round.PREVOTE_DECISION_MADE ->
+		cancel_timer_for_on_timeout_propose_for_process_in_round.p.round ->  
+		Skip
+		[]
+		[BOUND_DELTA > INIT_TIMEOUT_PROPOSE + round * TIMEOUT_DELTA]
+		OnTimeoutPropose(p, round)
+	);
+
+UponProposalNewValue(p) = 
+	[message_logs.ContainsProposal(p, rounds[p], -1) && steps[p] == PROPOSE]
+	UponProposalNewValueAuxiliary(p, rounds[p], locked_values[p], locked_rounds[p]);
+
+UponProposalNewValueAuxiliary(p, round, locked_value, locked_round) = 
+	mutex[p]!ACQUIRE -> 
+	upon_receiving_proposal_with_new_value_by_process_in_round.p.round -> 
+	ifa (round % N == p) {
+		no_timeout_propose_set_for_process_in_round.p.round -> Skip
+	} else {
+		timeout_propose_signal[p]!round.PREVOTE_DECISION_MADE -> Skip
+	};
+	ifa ((
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, round) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, round) == DECISION_F)
+		) && 
+		(locked_round == -1 || locked_value == message_logs.GetProposalValue(p, round))) {
+		prepare_prevote_v_for_process_in_round.p.round -> 
+		BroadcastPrevoteMessage(p, round, message_logs.GetProposalValue(p, round))
+	} else {
+		prepare_prevote_nil_for_process_in_round.p.round -> 
+		BroadcastPrevoteMessage(p, round, NIL)
+	};
+	update_step_to_prevote_for_process_in_round.p.round{
+		steps[p] = PREVOTE;
+	} -> 
+	mutex[p]!RELEASE -> 
+	UponProposalNewValue(p);
+
+UponProposalOldValue(p) = 
+	[message_logs.ContainsProposalAndSufficientPrevotesForPrevoting(p, rounds[p]) && steps[p] == PROPOSE]
+	UponProposalOldValueAuxiliary(p, rounds[p], locked_values[p], locked_rounds[p]);
+
+UponProposalOldValueAuxiliary(p, round, locked_value, locked_round) = 
+	mutex[p]!ACQUIRE -> 
+	upon_receiving_proposal_and_prevotes_with_old_value_by_process_in_round.p.round -> 
+	ifa (round % N == p) {
+		no_timeout_propose_set_for_process_in_round.p.round -> Skip
+	} else {
+		timeout_propose_signal[p]!round.PREVOTE_DECISION_MADE -> Skip
+	};
+	ifa ((
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, round) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, round) == DECISION_F)
+		) && 
+		(locked_round <= message_logs.GetProposalValidRound(p, round) || locked_value == message_logs.GetProposalValue(p, round))) {
+		prepare_prevote_v_for_process_in_round.p.round -> 
+		BroadcastPrevoteMessage(p, round, message_logs.GetProposalValue(p, round))
+	} else {
+		prepare_prevote_nil_for_process_in_round.p.round -> 
+		BroadcastPrevoteMessage(p, round, NIL)
+	};
+	update_step_to_prevote_for_process_in_round.p.round{
+		steps[p] = PREVOTE;
+	} -> 
+	mutex[p]!RELEASE -> 
+	UponProposalOldValue(p);
+
+UponSufficientPrevoteAny(p, effective_round) = 
+	[rounds[p] >= effective_round && steps[p] == PREVOTE && message_logs.ContainsSufficientPrevotes(p, rounds[p], MESSAGE_LOG_DEFAULT_VALUE)]
+	(ScheduleOnTimeoutPrevote(p, rounds[p]) ||| UponSufficientPrevoteAny(p, rounds[p] + 1));
+
+ScheduleOnTimeoutPrevote(p, round) = 
+	upon_receiving_prevotes_with_any_payload_by_process_in_round.p.round -> 
+	schedule_timer_for_on_timeout_prevote_for_process_in_round.p.round -> 
+	(
+		timeout_prevote_signal[p]?round.PRECOMMIT_DECISION_MADE -> 
+		cancel_timer_for_on_timeout_prevote_for_process_in_round.p.round -> 
+		Skip
+		[]
+		[BOUND_DELTA > INIT_TIMEOUT_PREVOTE + round * TIMEOUT_DELTA]
+		OnTimeoutPrevote(p, round)
+	);
+	
+UponSufficientPrevoteValue(p, effective_round) = 
+	[
+		rounds[p] >= effective_round && 
+		steps[p] >= PREVOTE && 
+		message_logs.ContainsProposalAndSufficientPrevotesForPrecommitting(p, rounds[p]) &&
+		(
+			(honest_processes[p] == true && message_logs.GetProposalValue(p, rounds[p]) == DECISION_T) || 
+			(honest_processes[p] == false && message_logs.GetProposalValue(p, rounds[p]) == DECISION_F) 
+		)
+	]
+	UponSufficientPrevoteValueAuxiliary(p, rounds[p]);
+	
+
+UponSufficientPrevoteValueAuxiliary(p, round) = 
+	mutex[p]!ACQUIRE -> 
+	upon_receiving_prevotes_with_value_by_process_in_round.p.round -> 
+	ifa (steps[p] == PREVOTE) {
+		timeout_prevote_signal[p]!round.PRECOMMIT_DECISION_MADE -> 
+		update_locked_value_for_process_in_round.p.round{
+			locked_values[p] = message_logs.GetProposalValue(p, round);
+		} -> 
+		update_locked_round_for_process_in_round.p.round{
+			locked_rounds[p] = round;
+		} -> 
+		BroadcastPrecommitMessage(p, round, message_logs.GetProposalValue(p, round));
+		update_step_to_precommit_for_process_in_round.p.round{
+			steps[p] = PRECOMMIT;
+		} -> 
+		Skip
+	};
+	update_valid_value_for_process_in_round.p.round{
+		valid_values[p] = message_logs.GetProposalValue(p, round)
+	} -> 
+	update_valid_round_for_process_in_round.p.round{
+		valid_rounds[p] = round
+	} -> 
+	mutex[p]!RELEASE -> 
+	UponSufficientPrevoteValue(p, round + 1);
+
+UponSufficientPrevoteNil(p) = 
+	[message_logs.ContainsSufficientPrevotes(p, rounds[p], NIL) && steps[p] == PREVOTE]
+	UponSufficientPrevoteNilAuxiliary(p, rounds[p]);
+
+UponSufficientPrevoteNilAuxiliary(p, round) = 
+	mutex[p]!ACQUIRE -> 
+	upon_receiving_prevotes_with_nil_by_process_in_round.p.round -> 
+	timeout_prevote_signal[p]!round.PRECOMMIT_DECISION_MADE -> 
+	BroadcastPrecommitMessage(p, round, NIL);
+	update_step_to_precommit_for_process_in_round.p.round{
+		steps[p] = PRECOMMIT;
+	} -> 
+	mutex[p]!RELEASE -> 
+	UponSufficientPrevoteNil(p);
+
+UponSufficientPrecommitAny(p, effective_round) = 
+	[rounds[p] >= effective_round && message_logs.ContainsSufficientPrecommits(p, rounds[p], MESSAGE_LOG_DEFAULT_VALUE)]
+	(ScheduleOnTimeoutPrecommit(p, rounds[p]) ||| UponSufficientPrecommitAny(p, rounds[p] + 1));
+
+ScheduleOnTimeoutPrecommit(p, round) = 
+	upon_receiving_precommits_with_any_payload_by_process_in_round.p.round -> 
+	schedule_timer_for_on_timeout_precommit_for_process_in_round.p.round -> 
+	(
+		timeout_precommit_signal[p]?round.COMMIT_DECISION_MADE -> 
+		cancel_timer_for_on_timeout_precommit_for_process_in_round.p.round -> 
+		Skip
+		[]
+		[BOUND_DELTA > INIT_TIMEOUT_PRECOMMIT + round * TIMEOUT_DELTA]
+		OnTimeoutPrecommit(p, round)
+	);
+
+UponSufficientPrecommitValue(p) = 
+	[decisions[p] == NIL && message_logs.ContainsProposalAndSufficientPrecommits(p)]
+	UponSufficientPrecommitValueAuxiliary(p, rounds[p]);
+
+UponSufficientPrecommitValueAuxiliary(p, round) = 
+	mutex[p]!ACQUIRE -> 
+	upon_receiving_proposal_and_precommits_with_value_by_process_in_round.p.round -> 
+	ifa ((honest_processes[p] == true && message_logs.GetCommitReadyValue(p) == DECISION_T) ||
+		 (honest_processes[p] == false && message_logs.GetCommitReadyValue(p) == DECISION_F)) {
+		timeout_precommit_signal[p]!round.COMMIT_DECISION_MADE -> 
+		update_decision_to_commit_ready_value_for_process_in_round.p.round{
+			decisions[p] = message_logs.GetCommitReadyValue(p);
+		} -> 
+		mutex[p]!RELEASE -> 
+		Skip
+	} else {
+		mutex[p]!RELEASE -> 
+		Skip
+	};
+
+UponSufficientMessageAny(p, effective_round) = 
+	[
+		message_logs.GetLatestRoundWithSufficientMessages(p) > effective_round && 
+		message_logs.GetLatestRoundWithSufficientMessages(p) > rounds[p]
+	]
+	UponSufficientMessageAnyAuxiliary(p, message_logs.GetLatestRoundWithSufficientMessages(p));
+
+UponSufficientMessageAnyAuxiliary(p, round) = 
+	StartRound(p, round) ||| UponSufficientMessageAny(p, round);
+
+OnTimeoutPropose(p, round) = 
+	mutex[p]!ACQUIRE -> 
+	ifa (round == rounds[p] && steps[p] == PROPOSE) {
+		timeout_propose_by_process_in_round.p.round -> 
+		BroadcastPrevoteMessage(p, round, NIL);
+		update_step_to_prevote_for_process_in_round.p.round{
+			steps[p] = PREVOTE;
+		} -> 
+		mutex[p]!RELEASE -> Skip
+	} else {
+		mutex[p]!RELEASE -> Skip
+	};
+
+OnTimeoutPrevote(p, round) = 
+	mutex[p]!ACQUIRE -> 
+	ifa (round == rounds[p] && steps[p] == PREVOTE) {
+		timeout_prevote_by_process_in_round.p.round -> 
+		BroadcastPrecommitMessage(p, round, NIL);
+		update_step_to_precommit_for_process_in_round.p.round{
+			steps[p] = PRECOMMIT;
+		} -> 
+		mutex[p]!RELEASE -> Skip
+	} else {
+		mutex[p]!RELEASE -> Skip
+	};
+
+OnTimeoutPrecommit(p, round) = 
+	timeout_precommit_by_process_in_round.p.round -> 
+	ifa (round == rounds[p]) {
+		StartRound(p, round + 1)
+	};
+
+DaemonThread(p) = 
+	proposal_broadcast_network[p]?proposal_message -> 
+	mutex[p]!ACQUIRE -> 
+	add_proposal_message_to_message_log_for_process.p{
+		message_logs.AddProposal(p, proposal_message);
+	} -> 
+	mutex[p]!RELEASE -> 
+	DaemonThread(p)
+	[]
+	prevote_broadcast_network[p]?prevote_message -> 
+	mutex[p]!ACQUIRE -> 
+	add_prevote_message_to_message_log_for_process.p{
+		message_logs.AddPrevote(p, prevote_message);
+	} -> 
+	mutex[p]!RELEASE -> 
+	DaemonThread(p)
+	[] 
+	precommit_broadcast_network[p]?precommit_message -> 
+	mutex[p]!ACQUIRE -> 
+	add_precommit_message_to_message_log_for_process.p{
+		message_logs.AddPrecommit(p, precommit_message);
+	} -> 
+	mutex[p]!RELEASE -> 
+	DaemonThread(p);
+
+Mutex(p) = 
+	mutex[p]?ACQUIRE -> 
+	mutex[p]?RELEASE -> 
+	Mutex(p);
+
+Tendermint() = 
+	||| p: {0..N-1} @ (
+		StartRound(p, 0) ||| 
+		UponProposalNewValue(p) ||| 
+		UponProposalOldValue(p) ||| 
+		UponSufficientPrevoteAny(p, 0) |||
+		UponSufficientPrevoteValue(p, 0) ||| 
+		UponSufficientPrevoteNil(p) ||| 
+		UponSufficientPrecommitAny(p, 0) |||
+		UponSufficientPrecommitValue(p) ||| 
+		UponSufficientMessageAny(p, 0) ||| 
+		DaemonThread(p) ||| 
+		Mutex(p)
+	);
+
+#assert Tendermint() deadlockfree;
+
+#define four_processes_are_honest (
+	honest_processes[0] == true && 
+	honest_processes[1] == true && 
+	honest_processes[2] == true && 
+	honest_processes[3] == true
+);
+#define three_processes_are_honest (
+	honest_processes[1] == true && 
+	honest_processes[2] == true && 
+	honest_processes[3] == true
+);
+
+#define four_processes_make_true_decisions (
+	decisions[0] == DECISION_T && 
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T && 
+	decisions[3] == DECISION_T
+);
+#define three_processes_make_true_decisions (
+	decisions[1] == DECISION_T && 
+	decisions[2] == DECISION_T && 
+	decisions[3] == DECISION_T
+);
+#assert Tendermint() |= [] (four_processes_are_honest -> <> four_processes_make_true_decisions);
+#assert Tendermint() |= [] (three_processes_are_honest -> <> three_processes_make_true_decisions);
+#assert Tendermint() reaches four_processes_make_true_decisions;
+#assert Tendermint() reaches three_processes_make_true_decisions;
+
